@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  receipt-processor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: n8n-receipt-processor
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./uploads:/app/uploads
+    restart: unless-stopped
+    environment:
+      - TZ=UTC
