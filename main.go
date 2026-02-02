@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -13,7 +15,6 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
-	gosseract "github.com/otiai10/gosseract/v2"
 )
 
 // Receipt model
@@ -51,6 +52,70 @@ type GeminiParsedData struct {
 }
 
 var db *sql.DB
+
+// isPDFTextBased checks if a PDF contains extractable text using pdftotext
+func isPDFTextBased(pdfPath string) (bool, error) {
+	// Try to extract text using pdftotext
+	cmd := exec.Command("pdftotext", "-l", "1", pdfPath, "-")
+	output, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("failed to run pdftotext: %v", err)
+	}
+
+	// Check if extracted text has meaningful content (more than whitespace)
+	text := strings.TrimSpace(string(output))
+	return len(text) > 10, nil // If more than 10 characters, consider it text-based
+}
+
+// extractTextFromPDF extracts text from a text-based PDF using pdftotext
+func extractTextFromPDF(pdfPath string) (string, error) {
+	cmd := exec.Command("pdftotext", "-layout", pdfPath, "-")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to extract text from PDF: %v", err)
+	}
+	return string(output), nil
+}
+
+// convertPDFToImagesAndOCR converts PDF to images using pdftoppm and performs OCR
+func convertPDFToImagesAndOCR(pdfPath string) (string, error) {
+	// Create temp directory for images
+	tempDir, err := os.MkdirTemp("", "pdf-ocr-*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Convert PDF to PNG images using pdftoppm
+	outputPrefix := filepath.Join(tempDir, "page")
+	cmd := exec.Command("pdftoppm", "-png", "-r", "300", pdfPath, outputPrefix)
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to convert PDF to images: %v", err)
+	}
+
+	// Find all generated images
+	images, err := filepath.Glob(filepath.Join(tempDir, "*.png"))
+	if err != nil || len(images) == 0 {
+		return "", fmt.Errorf("no images generated from PDF")
+	}
+
+	// Perform OCR on each image using command-line tesseract
+	var allText bytes.Buffer
+
+	for _, imagePath := range images {
+		cmd := exec.Command("tesseract", imagePath, "stdout")
+		output, err := cmd.Output()
+		if err != nil {
+			log.Printf("Warning: OCR failed for %s: %v", imagePath, err)
+			continue
+		}
+
+		allText.Write(output)
+		allText.WriteString("\n\n---PAGE BREAK---\n\n")
+	}
+
+	return allText.String(), nil
+}
 
 // Initialize database connection
 func initDB() error {
@@ -269,29 +334,56 @@ func main() {
 		}
 		defer os.Remove(tempPath)
 
-		// Initialize OCR client
-		client := gosseract.NewClient()
-		defer client.Close()
+		var text string
+		var processingMethod string
 
-		// Set image path
-		if err := client.SetImage(tempPath); err != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"error": fmt.Sprintf("Failed to set image: %v", err),
-			})
-		}
+		// Check if file is a PDF
+		if strings.ToLower(filepath.Ext(file.Filename)) == ".pdf" {
+			// Detect PDF type
+			isTextPDF, err := isPDFTextBased(tempPath)
+			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+					"error": fmt.Sprintf("Failed to detect PDF type: %v", err),
+				})
+			}
 
-		// Extract text
-		text, err := client.Text()
-		if err != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"error": fmt.Sprintf("OCR failed: %v", err),
-			})
+			if isTextPDF {
+				// Text-based PDF: use pdftotext (Poppler)
+				processingMethod = "pdftotext"
+				text, err = extractTextFromPDF(tempPath)
+				if err != nil {
+					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+						"error": fmt.Sprintf("Failed to extract text from PDF: %v", err),
+					})
+				}
+			} else {
+				// Image-based PDF: convert to images and use OCR
+				processingMethod = "pdftoppm + OCR"
+				text, err = convertPDFToImagesAndOCR(tempPath)
+				if err != nil {
+					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+						"error": fmt.Sprintf("Failed to OCR PDF: %v", err),
+					})
+				}
+			}
+		} else {
+			// Regular image: use OCR directly
+			processingMethod = "OCR"
+			cmd := exec.Command("tesseract", tempPath, "stdout")
+			output, err := cmd.Output()
+			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+					"error": fmt.Sprintf("OCR failed: %v", err),
+				})
+			}
+			text = string(output)
 		}
 
 		return c.JSON(fiber.Map{
-			"success":  true,
-			"filename": file.Filename,
-			"text":     text,
+			"success":           true,
+			"filename":          file.Filename,
+			"text":              text,
+			"processing_method": processingMethod,
 		})
 	})
 	// Receipt ingest endpoint
@@ -364,42 +456,52 @@ func main() {
 			})
 		}
 
-		// Perform OCR on the uploaded file (only for images, not PDFs)
+		// Perform OCR or text extraction on the uploaded file
 		ocrText := ""
 		ocrStatus := "success"
 		ocrError := ""
+		processingMethod := ""
 
-		// Check if file is an image (not PDF)
-		isImage := contentType != "application/pdf" && contentType != ""
+		// Check if file is a PDF
+		isPDF := contentType == "application/pdf" || strings.ToLower(ext) == ".pdf"
 
-		if !isImage {
-			ocrStatus = "skipped"
-			ocrError = "PDF files require separate processing"
-		} else {
-			// Read file bytes for OCR
-			fileBytes, err := os.ReadFile(savePath)
+		if isPDF {
+			// Detect PDF type
+			isTextPDF, err := isPDFTextBased(savePath)
 			if err != nil {
-				log.Printf("OCR: Failed to read file: %v", err)
+				log.Printf("PDF Detection: Failed: %v", err)
 				ocrStatus = "failed"
-				ocrError = fmt.Sprintf("Failed to read file: %v", err)
-			} else {
-				client := gosseract.NewClient()
-				defer client.Close()
-
-				if err := client.SetImageFromBytes(fileBytes); err != nil {
-					log.Printf("OCR: Failed to set image: %v", err)
+				ocrError = fmt.Sprintf("Failed to detect PDF type: %v", err)
+			} else if isTextPDF {
+				// Text-based PDF: use pdftotext
+				processingMethod = "pdftotext"
+				ocrText, err = extractTextFromPDF(savePath)
+				if err != nil {
+					log.Printf("PDF Text Extraction: Failed: %v", err)
 					ocrStatus = "failed"
-					ocrError = fmt.Sprintf("Failed to set image: %v", err)
-				} else {
-					text, err := client.Text()
-					if err != nil {
-						log.Printf("OCR: Failed to extract text: %v", err)
-						ocrStatus = "failed"
-						ocrError = fmt.Sprintf("Failed to extract text: %v", err)
-					} else {
-						ocrText = text
-					}
+					ocrError = fmt.Sprintf("Failed to extract text: %v", err)
 				}
+			} else {
+				// Image-based PDF: convert to images and use OCR
+				processingMethod = "pdftoppm + OCR"
+				ocrText, err = convertPDFToImagesAndOCR(savePath)
+				if err != nil {
+					log.Printf("PDF OCR: Failed: %v", err)
+					ocrStatus = "failed"
+					ocrError = fmt.Sprintf("Failed to OCR PDF: %v", err)
+				}
+			}
+		} else {
+			// Regular image: use OCR directly
+			processingMethod = "OCR"
+			cmd := exec.Command("tesseract", savePath, "stdout")
+			output, err := cmd.Output()
+			if err != nil {
+				log.Printf("OCR: Failed to extract text: %v", err)
+				ocrStatus = "failed"
+				ocrError = fmt.Sprintf("Failed to extract text: %v", err)
+			} else {
+				ocrText = string(output)
 			}
 		}
 
@@ -493,9 +595,10 @@ func main() {
 			"file_path":     savePath,
 			"status":        "needs_review",
 			"ocr": fiber.Map{
-				"status": ocrStatus,
-				"text":   ocrText,
-				"error":  ocrError,
+				"status":            ocrStatus,
+				"text":              ocrText,
+				"error":             ocrError,
+				"processing_method": processingMethod,
 			},
 			"gemini": fiber.Map{
 				"status":   geminiStatus,

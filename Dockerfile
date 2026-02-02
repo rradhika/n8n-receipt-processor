@@ -22,10 +22,11 @@ RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o main .
 # Final stage
 FROM alpine:latest
 
-# Install Tesseract OCR and dependencies
+# Install Tesseract OCR, Poppler tools, and dependencies
 RUN apk add --no-cache \
     tesseract-ocr \
     tesseract-ocr-data-eng \
+    poppler-utils \
     libc6-compat
 
 # Set working directory
