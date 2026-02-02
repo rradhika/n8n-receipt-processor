@@ -1,6 +1,25 @@
 version: '3.8'
 
 services:
+  mysql:
+    image: mysql:8.0
+    container_name: receipt-processor-mysql
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: receipt_processor
+      MYSQL_USER: receipt_user
+      MYSQL_PASSWORD: receipt_pass
+    ports:
+      - "3308:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
   receipt-processor:
     build:
       context: .
@@ -13,3 +32,13 @@ services:
     restart: unless-stopped
     environment:
       - TZ=UTC
+      - MYSQL_DSN=receipt_user:receipt_pass@tcp(mysql:3306)/receipt_processor?parseTime=true
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-1.5-flash}
+      - GEMINI_PROMPT=${GEMINI_PROMPT}
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  mysql_data:
